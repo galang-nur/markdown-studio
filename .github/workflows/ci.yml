@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets you trigger a run by hand from the Actions tab.
+  workflow_dispatch:
+
+# A new push to the same branch makes the in-flight run obsolete — cancel it
+# rather than paying for a result nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint, types, the markdown/XSS suite, and a production build.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Report every failing version, not just the first one to fall over.
+      fail-fast: false
+      matrix:
+        # 20 is the floor the Dockerfile and the PRD target; 24 is what the app
+        # is actually developed on. Both must stay green.
+        node: [20, 24]
+
+    env:
+      # None of these steps drive a browser, and Puppeteer's postinstall would
+      # otherwise pull ~300MB of Chromium on every run. The docker job below is
+      # what actually exercises Chromium.
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `npm ci` (not `npm install`) — installs exactly what package-lock.json
+      # pins and fails if the lockfile is out of sync with package.json.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # 18 assertions. Includes the XSS guarantees: <script>, <iframe>, onerror,
+      # and javascript: URLs must not survive the sanitizer.
+      - name: Markdown & sanitizer tests
+        run: npm run test:markdown
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Builds the image AND runs it, then exports a real PDF through the running
+  # container. A successful `docker build` only proves the image assembles; it
+  # says nothing about whether Chromium can actually launch as a non-root user
+  # with its sandbox disabled. That is the part worth proving.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true # make the image available to the local docker daemon
+          tags: markdown-studio:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container
+        run: docker run -d --name studio -p 3000:3000 markdown-studio:ci
+
+      - name: Wait for it to serve
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://localhost:3000/; then
+              echo "up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::container never became ready"
+          docker logs studio
+          exit 1
+
+      # The real test: does headless Chromium launch inside the container and
+      # produce a PDF?
+      - name: Export a PDF end-to-end
+        run: |
+          code=$(curl -s -o out.pdf -w '%{http_code}' \
+            -X POST http://localhost:3000/api/export-pdf \
+            -H 'Content-Type: application/json' \
+            -d '{"markdown":"# CI\n\nHello **world**.\n\n```go\nfmt.Println(\"hi\")\n```\n","filename":"ci"}')
+
+          if [ "$code" != "200" ]; then
+            echo "::error::export returned HTTP $code"
+            cat out.pdf
+            docker logs studio
+            exit 1
+          fi
+
+          # A JSON error body would also be written to out.pdf, so check the
+          # magic bytes rather than trusting the status code alone.
+          if [ "$(head -c 4 out.pdf)" != "%PDF" ]; then
+            echo "::error::response was not a PDF"
+            head -c 400 out.pdf
+            docker logs studio
+            exit 1
+          fi
+
+          echo "PDF generated in-container: $(wc -c < out.pdf) bytes"
+
+      - name: Container logs
+        if: always()
+        run: docker logs studio
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f studio
