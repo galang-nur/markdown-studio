@@ -37,6 +37,18 @@ npm run check        # lint + typecheck + markdown/XSS tests
 npm run build && npm start
 ```
 
+### Before pushing
+
+```bash
+npm run ci:local                  # everything CI runs, on your machine
+npm run ci:local -- --no-docker   # skip the container stage (faster)
+```
+
+`ci:local` mirrors `.github/workflows/ci.yml` step for step — lint, typecheck,
+the markdown/XSS suite, a production build, then it builds the Docker image,
+runs it, and exports a real PDF through the container. Green here means green in
+CI. Keep the two in lockstep: a step added to one belongs in the other.
+
 ## Docker
 
 Puppeteer needs a Chromium binary, which is why this is built to self-host rather
